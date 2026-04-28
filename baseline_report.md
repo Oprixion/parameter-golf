@@ -142,13 +142,64 @@ Two facts drive the strategy:
 
 2. **Layers are independent (×9 multiplier on all block params).** The 9 unique blocks contain 16.5M of the 17.06M total parameters. Sharing weights across blocks compounds savings linearly.
 
-### Highest-leverage levers given remaining time
+### Execution Plan
 
-**Lever 1 — Layer tying with depth recurrence.** Replacing 9 independent blocks with N unique blocks repeated through 9 forward passes saves `(9 − N) × 1.84M` parameters. Even modest sharing (3 unique blocks) saves ~11M params.
+The challenge closes April 30 (3 days). The plan is structured around that hard deadline. The central mistake to avoid is treating each technique as a separate experiment — that costs ~30–60 minutes per iteration including setup, run, and evaluation. There is not enough time for 8 sequential ablations. The strategy is: **port the full proven SOTA stack in one shot, verify it works, then iterate only on genuinely open questions.**
 
-**Lever 2 — Low-rank MLP factorization.** Replace the (1024 × 512) `fc` and (512 × 1024) `proj` matrices with rank-`r` factorizations. At r=128, MLP params drop from 1.05M per block to ~0.26M per block — saving ~7M params total.
+#### Pre-work — Before Any Training Run
 
-**Lever 3 — Spend the headroom productively.** With ~5.7 MB of post-zlib headroom, lower-precision storage (int4 or even ternary) for weights could free enough budget to add layers, increase `d_model`, or add a wider MLP.
+These are blocking tasks with zero quality risk that must be done first:
+
+1. **Download tokenized data.** SP4096 and SP8192 pre-tokenized FineWeb shards are on `kevclark/parameter-golf` on HuggingFace. Download the appropriate variant before touching the model code — all training runs are blocked on this.
+2. **Compress `train_gpt.py` with LZMA.** A trivial wrapper recovers ~43 KB of artifact headroom at zero cost. Do this once and never think about it again.
+3. **Verify H100 environment.** Every April leaderboard entry requires Flash Attention 3 (`flash_attn_interface`), PyTorch ≥ 2.9.1+cu128. The local dev environment uses math-SDP fallback (see CHANGES.md); the submission environment must have FA3 compiled. Verify this before the first real run.
+
+#### Step 1 — Full SOTA Port (Day 1)
+
+Do not replicate SOTA incrementally. Implement the entire April 5 stack in a single code pass and get a working run that reaches ~1.085–1.097 BPB. Every component below has been independently validated across multiple entries.
+
+| Change from baseline | Why |
+|---|---|
+| ~~zlib level-9 → brotli-11 + byte-shuffle~~ | ✅ Done — freed ~320 KB; grows with WD |
+| ~~SP1024 → SP4096 vocab~~ | ✅ Done — −0.136 BPB (−6.7%) at mini-run scale |
+| ~~9 layers → 11 layers, MLP 2× → 4×~~ | ✅ Done Larger model; compressibility of well-regularized weights compensates |
+| ~~Muon WD 0.01 → 0.085–0.090~~ | ✅ Done Weight magnitude ↓ → brotli entropy ↓ → artifact smaller → enables wider MLP |
+| ~~naive int8 round → full Hessian GPTQ int6 (SDClip)~~ | ✅ Done Higher quantization fidelity; `clip = k × std(row)` is principled and tunable |
+| ~~MuonEq-R (row-normalize before Newton-Schulz)~~ | ✅ Done Zero byte cost; ~0.001 BPB improvement |
+| ~~Depth recurrence: loop layers 4,5 ×2, activate at step ~3000~~ | ✅ Done 13 virtual layers from 11 physical; zero extra params |
+| EMA decay 0.9965 | Stable weight averaging with no SWA scheduling complexity |
+| QK-Gain init = 4.0 | Conservative starting point; monotonic improvement confirmed up to 5.25 |
+
+**Calibration check after this run:** Measure post-brotli artifact size. If above 16 MB, increase WD by 0.005 increments. The correlation between weight RMS and brotli compressibility is R²≈0.99 — WD is the primary artifact-size dial.
+
+#### Step 2 — Complete the SOTA Stack (Day 2)
+
+These are the differences between the April 5 run (~1.0856) and the April 9 SOTA (1.0810). They are not "novel" — they are already proven and just not in the Step 1 code.
+
+1. **SP4096 → SP8192.** Each additional vocabulary doubling gives a measurable BPB improvement. Requires downloading the SP8192 data shard.
+2. **GPTQ on the embedding table.** The April 5 record used simple round-to-nearest for embeddings; April 9 applied full Hessian GPTQ to them too. Small but consistent win.
+3. **Parallel residuals from layer 7.** GPT-J style: attention and MLP read from the same pre-residual input and a learned `lane_merge` scalar combines them. Allows specialization without adding parameters.
+4. **3-layer recurrence (extend loop to layers 3,4,5).** The step from 2-layer to 3-layer recurrence contributed to the April 9 improvement.
+5. **QK-Gain tuning: sweep 4.0 → 5.0 → 5.25.** Monotonically improving; find the optimum.
+6. **Score-First Legal TTT.** SGD adaptation (lr=0.005, momentum=0.9, 3 epochs per 32K-token chunk, cosine LR decay). Score all tokens in a chunk under `torch.no_grad()` *before* any weight update. This is the highest-return remaining lever and should not be treated as optional — it is responsible for a significant share of the gap between 1.0856 and 1.0810. The four compliance conditions (causality, normalized distribution, score-before-update, single-pass) must be verified explicitly.
+
+#### Step 3 — Genuine Frontier (Day 3)
+
+Only attempt these if Step 2 is stable and within budget. These are techniques absent from every leaderboard entry.
+
+1. **d_model scaling analysis.** Every leaderboard entry uses d_model=512. At int6 with brotli-11 and Muon WD=0.095, is d_model=640 feasible within 16 MB? Run a parameter count + estimated compression calculation before attempting a training run. If it fits on paper, try it — a wider residual stream with fewer layers may represent a different and better optimum.
+2. **Multi-head Latent Attention (MLA).** DeepSeek-V2 style: compress KV into a low-rank latent before projection. This reduces attention KV parameters by 4–8× with minimal quality loss, potentially freeing budget for more MLP width or extra layers. Not attempted by any entry.
+3. **Per-layer SDClip threshold search.** The current `clip = k × std(row)` uses a global k. Allowing k to vary per layer (tuned on a small Hessian trace) could find a better rate-distortion frontier layer by layer, recovering a small but consistent BPB gain.
+4. **QK-Gain > 5.25.** The leaderboard shows monotonic improvement up to 5.25 with no confirmed ceiling. Test 5.5 and 6.0.
+
+#### What Not to Attempt
+
+| Idea | Why not |
+|---|---|
+| Low-rank MLP factorization | Every top run expanded MLP to 4×; factorization destroys the WD-compressibility dividend |
+| Int4 / ternary naive quantization | Higher implementation risk than GPTQ int6 with worse empirical results across the board |
+| QAT training loop | April 1 record explicitly removed it: "appeared to provide little or no benefit"; GPTQ post-training is sufficient |
+| Incremental one-change-at-a-time experiments | No time; the deadline is April 30 |
 
 ### Risk assessment
 

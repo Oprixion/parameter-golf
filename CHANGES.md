@@ -331,3 +331,288 @@ The EMA half-life at $\alpha=0.9965$ is $\ln(2)/\ln(1/0.9965) \approx 198$ steps
 The −231 KB size reduction is also spurious: near-zero random init weights (`std=0.005`) are trivially compressible, not an indicator of better-regularized trained weights.
 
 **This is a known mathematical artifact of running EMA for fewer steps than its half-life.** The code is correct. By step 3000, contamination is $0.9965^{3000} \approx 0.003\%$ — completely negligible. At step 20K it is effectively zero. EMA is kept without modification; full-run impact will be measured on the server run.
+
+---
+
+## 12. QK-Gain init 1.5 → 4.0
+
+**File:** `train_gpt.py` — `Hyperparameters`
+
+Raised the initialization of the per-head query gain scalar from `1.5` to `4.0`. `q_gain` is a learnable `nn.Parameter` of shape `(num_heads,)` applied to queries after RMS-norm and RoPE, just before the dot-product attention:
+
+```python
+q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+```
+
+It controls the effective softmax temperature: higher gain → sharper attention → stronger selection of relevant positions. The parameter is fully trainable (scalar AdamW group); this change only sets the starting value.
+
+```python
+# Before
+qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+
+# After
+qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 4.0))
+```
+
+At init=1.5 the model wastes early training steps pushing `q_gain` up from a near-uniform attention regime. Starting at 4.0 puts attention in the meaningfully sharp regime from step 0, giving key/query projections a useful gradient signal immediately. Leaderboard records show monotonic BpB improvement as init increases from 1.0 → 1.5 → 4.0 → 5.0 → 5.25.
+
+**Impact (mini-run, 200 steps):**
+
+The roundtrip BpB (2.4584) is dominated by EMA init contamination (same artifact as Change 11 — 49.6% random init at 200 steps) and carries no information about this change. The training val_bpb is the relevant signal:
+
+| Metric | Run 8 (baseline, no EMA/recur) | Run 11 (QK=4.0, +EMA, +recur@100) | Delta |
+|---|---|---|---|
+| Training val_bpb | 1.8397 | **1.8380** | **−0.0017** |
+| Roundtrip val_bpb | 1.8608 | 2.4584 | EMA artifact, not meaningful |
+| Submission size | 4,692,494 B | 4,468,729 B | EMA artifact, not meaningful |
+
+The −0.0017 training BpB is a positive signal at 200 steps, consistent with the leaderboard trend. Full-run impact will be confirmed on the server run.
+
+---
+
+## 13. relu² → LeakyReLU(0.5)²
+
+**File:** `train_gpt.py` — `MLP.forward`
+
+Replaced the `relu²` activation with `LeakyReLU(0.5)²`. One line change; zero parameter count change; zero artifact size change.
+
+```python
+# Before
+x = torch.relu(self.fc(x))
+return self.proj(x.square())
+
+# After
+x = F.leaky_relu(self.fc(x), negative_slope=0.5)
+return self.proj(x.square())
+```
+
+**Motivation — quantization gap interaction:**
+
+With `relu²`, every negative pre-activation becomes exactly zero after ReLU. For a typical normally-distributed hidden layer, ~50% of activations are zero. This creates a bimodal activation distribution seen by the `proj` weight's Hessian: half the calibration samples contribute zero to `X^T X` for those columns. The resulting Hessian is rank-deficient or near-singular for those input dimensions, so GPTQ's error propagation is unreliable — it cannot correctly compensate rounding error for columns that were never activated.
+
+With `LeakyReLU(0.5)`, negative inputs pass through at half magnitude and are squared: `(0.5x)² = 0.25x²`. No activations are exactly zero; every column of the `proj` weight receives nonzero Hessian signal from every calibration sample. This makes the Hessian better-conditioned, GPTQ more accurate, and the quantization gap smaller.
+
+The same argument applies to the interaction with **depth recurrence**: layers 4 and 5 are executed twice with the same weights but different activation patterns on each pass. With `relu²`, each pass zeros out a different ~50% of channels, making the union of dead neurons across both passes hard to calibrate. With `LeakyReLU(0.5)²`, all channels remain active on every pass.
+
+The record from 2026-03-23 (`LeakyReLU_LegalTTT_ParallelMuon`) introduced this activation and all subsequent SOTA entries carry it.
+
+**Impact:** Mini-run pending. Training val_bpb signal expected to match or slightly improve vs. Change 12. Quantization gap expected to shrink at full training.
+
+---
+
+## 14. SP4096 → SP8192 vocabulary
+
+**File:** `train_gpt.py` — `Hyperparameters`
+
+Doubled the tokenizer vocabulary from 4096 to 8192 tokens. Larger tokens encode more bytes per prediction step, directly reducing BPB independent of model capacity.
+
+```python
+# Before
+data_path      = "./data/datasets/fineweb10B_sp4096"
+tokenizer_path = "./data/tokenizers/fineweb_4096_bpe.model"
+vocab_size     = 4096
+
+# After
+data_path      = "./data/datasets/fineweb10B_sp8192"
+tokenizer_path = "./data/tokenizers/fineweb_8192_bpe.model"
+vocab_size     = 8192
+```
+
+The embedding table grows from `4096×512 = 2.1M` to `8192×512 = 4.2M` parameters (+2.1M, +4.2 MB bf16). With tied embeddings quantized via GPTQ int8 SDClip (`clip_range=127`), the embedding contribution to artifact size remains within the 16 MB ceiling.
+
+**Throughput cost:** The larger embedding lookup adds ~33 ms per step (238 ms vs. 205 ms at SP4096), reducing steps completed in 1200 s from 5832 → 5028 (−804 steps, −13.8%). The pre-quant BPB gain still outweighs the training-budget loss.
+
+**Impact (Run 13 — full 20-min server run, 4×H100, 5028 steps, all Changes 1–13):**
+| Metric | Run 12 (SP4096) | Run 13 (SP8192) | Delta |
+|---|---|---|---|
+| Steps completed | 5832 | 5028 | −804 (−13.8%) |
+| Training val_bpb | 1.2142 | **1.1524** | **−0.062 (−5.1%)** |
+| Roundtrip val_bpb | 1.5208 | **1.4655** | **−0.055** |
+| Quantization gap | +0.307 | +0.313 | ~unchanged |
+| Artifact size | 13.10 MB | 14.10 MB | +1.00 MB |
+
+The pre-quant gain of −0.062 BPB exceeds the ~−0.025 estimate, confirming SP8192 is highly beneficial. EMA applied correctly (`ema_applied: loaded EMA shadow weights for quantization` confirmed in log). Artifact at 14.10 MB remains within the 16 MB limit.
+
+The quantization gap (~+0.31 BPB) is unchanged across both SP4096 and SP8192, confirming it is a structural problem: layers 4 and 5 are executed twice during the forward pass (depth recurrence) but GPTQ collects only one Hessian per physical layer. The mixed activation distribution from "first-pass" and "second-pass" inputs makes Hessian-based error compensation unreliable for those layers.
+
+**Next priorities to close the quantization gap:**
+1. **Parallel residuals (layers 7–10):** GPT-J-style parallel attn+MLP decouples their Hessians, expected to reduce quant gap by ~−0.15 BPB.
+2. **Recurrence [3,4,5]:** `recur_loop_start = 3` adds 2 virtual layers for ~−0.010 pre-quant BPB.
+3. **QK-gain 5.25:** `QK_GAIN_INIT=5.25` env var only, ~−0.005 BPB.
+
+---
+
+## 15. Parallel residuals — layers 7+ (GPT-J style)
+
+**File:** `train_gpt.py` — `Block.__init__`, `Block.forward`, `GPT.__init__`, `Hyperparameters`
+
+Added GPT-J style parallel residual connections for layers `>= parallel_resid_start` (default 7). Both attention and MLP read from the same pre-block input and their outputs are summed in one residual step. Zero parameter cost.
+
+**Motivation for GPTQ:** Decouples attention and MLP Hessian matrices — GPTQ error propagation is more reliable when the two sub-layers don't share input activations.
+
+**Impact (Run 14 — 2×H100, 4979 steps, bundled with recur [3,4,5]):**
+| Metric | Run 13 | Run 14 | Delta |
+|---|---|---|---|
+| Training val_bpb | 1.1524 | 1.1510 | −0.001 |
+| Roundtrip val_bpb | 1.4655 | 1.4658 | +0.000 |
+| Quant gap | +0.313 | +0.315 | ~unchanged |
+| Artifact size | 14.10 MB | 14.16 MB | +0.06 MB |
+
+Quant gap unchanged — shared-weight recurrence problem dominates.
+
+---
+
+## 16. Progressive depth recurrence curriculum (SOTA approach)
+
+**File:** `train_gpt.py` — `Hyperparameters`, `GPT.__init__`, new `GPT.activate_looping()`, main training loop
+
+Replaced binary `recur_start_step` activation with a two-phase wallclock-fraction curriculum matching the SOTA record `2026-04-06_SP8192_HessianSDClip_ProgressiveRecurrence` (+0.012 quant gap at 8×H100).
+
+**Changes:**
+1. `recur_loop_start` 3 → 4 (loop [4,5], 2 blocks instead of 3)
+2. `recur_num_loops` 1 → 2 (3 total passes through [4,5])
+3. `GPT.__init__` builds `_phase1_enc/dec` (1 extra repeat) and `_phase2_enc/dec` (2 extra repeats); `activate_looping(phase)` switches at runtime
+4. Phase 1 activates at 50% of `MAX_WALLCLOCK_SECONDS`; Phase 2 at 65%
+5. `UNTIE_LOOP_MLPS` default "1" → "0" (saves artifact size; SOTA doesn't use them)
+
+**Impact (Run 15 — 2×H100, MAX_WALLCLOCK=2400s, 5476 steps):**
+| Metric | Run 14 | Run 15 | Delta |
+|---|---|---|---|
+| Training val_bpb | 1.1510 | 1.1460 | −0.005 |
+| Roundtrip val_bpb | 1.4658 | **1.5614** | **+0.095 (worse)** |
+| Quant gap | +0.315 | **+0.415** | **+0.100 (worse)** |
+| Artifact size | 14.16 MB | 14.21 MB | +0.05 MB |
+
+Pre-quant improved but quant gap worsened. Shared-weight Hessian blending (blocks [4,5] run 3× with different activation distributions) dominates at 2×H100. SOTA's +0.012 gap likely requires 8×H100 scale.
+
+---
+
+## 17. Quant-gap fixes — bundle of 3 GPTQ corrections
+
+**File:** `train_gpt.py` — `collect_hessians`, `quantize_float_tensor_gptq`, `quantize_state_dict_int8`, `Hyperparameters.gptq_sdclip_k_matrix`
+
+After diagnosis on the +0.31 BPB post-quant gap (Run 13/14), three independent issues in the GPTQ pipeline were identified and fixed in one bundle. None depends on the others; each contributes to a smaller post-quant penalty.
+
+### 17a. Removed duplicate Hessian damping
+`collect_hessians` already adds `0.01 * mean_diag` damping at the end of accumulation. `quantize_float_tensor_gptq` then added the same damping a second time. The compounded ~2.01% damping flattens the Hessian diagonal, weakening (1) the descending-diagonal column ordering and (2) the off-diagonal entries of `Hinv` that drive GPTQ's error compensation. Fix: keep the damping in `collect_hessians`, remove the duplicate in `quantize_float_tensor_gptq`.
+
+### 17b. Lowered `gptq_sdclip_k_matrix` 12.85 → 5.0
+With `clip_range = 31` (int6) and `k = 12.85`, scale per row = `12.85·σ / 31 ≈ 0.414·σ`. A weight at ±3σ maps to int level ±7, so the bulk of the distribution uses only ~15 of 63 available int levels — most of int6's resolution is wasted. The 12.85 figure was tuned to maximize brotli compression (low entropy → smaller artifact), but at the cost of much larger quantization MSE. `k = 5.0` is closer to the MSE-optimal clip for an int6 Gaussian (~3σ) and uses ~38 of 63 levels. Trades a small artifact-size increase (still well under 16 MB on Run 14, 14.16 MB → ~14.5 MB expected) for materially smaller post-quant BPB.
+
+### 17c. Added Hessian collection for the tied lm_head
+With `tie_embeddings=True`, the model uses `F.linear(x, self.tok_emb.weight)` as the output projection. Because that call is a raw `F.linear` (not a `CastedLinear` module), the forward hook in `collect_hessians` never fired for the tied lm_head — and `quantize_state_dict_int8` then explicitly forced `H = None` for `is_embed`. Result: the largest single tensor in the artifact (~4.2M params on SP8192) was quantized without GPTQ error compensation despite being directly responsible for the cross-entropy logits.
+
+Fix: in `collect_hessians`, when `tie_embeddings` is True, register an additional hook on `model.final_norm` that accumulates `X^T X` from its output (which is exactly the input fed into `F.linear(x, tok_emb.weight)`). Store it under key `tok_emb.weight`. In `quantize_state_dict_int8`, drop the `not is_embed` constraint so the Hessian flows through to GPTQ. The embedding still uses `clip_range=127` (int8) and `k_embed=20.0` — only error compensation is added.
+
+```python
+# collect_hessians — added after the CastedLinear loop
+if model.tie_embeddings:
+    emb_dim = model.tok_emb.weight.shape[1]
+    hessians["tok_emb.weight"] = torch.zeros(emb_dim, emb_dim, dtype=torch.float32)
+    def lm_head_hook(_m, _inp, out):
+        x = out.detach().float()
+        if x.ndim == 3:
+            x = x.reshape(-1, x.shape[-1])
+        hessians["tok_emb.weight"].add_((x.T @ x).cpu())
+    hooks.append(model.final_norm.register_forward_hook(lm_head_hook))
+
+# quantize_state_dict_int8 — was forcing H=None for embed; now lets it pass through
+H = hessians.get(name) if hessians is not None else None
+```
+
+**Expected impact (full run):**
+- 17a (de-dup damping): ~−0.05 BPB
+- 17b (k=5.0): ~−0.10 BPB
+- 17c (lm_head Hessian): ~−0.03 to −0.05 BPB
+- Combined target: post-quant gap shrinks from +0.31 → roughly +0.10–0.15 BPB
+
+If 17b proves too aggressive on artifact size, try `k = 6.0` next; if it leaves headroom, try `k = 4.0`.
+
+**Not fixed yet (out of scope for this bundle):**
+- Shared-weight Hessian blending in recurrent layers (claim #1 from diagnosis): structural; the joint H = ΣHᵢ is correct for joint-MSE but column ordering / Hinv off-diagonals mix regimes. Mitigation = `untie_loop_mlps=True`, which adds ~300 KB but breaks the blending on the most error-sensitive sub-layer (proj). Worth re-running once 17a-c are validated.
+- Light QAT pass after GPTQ to close residual gap.
+
+---
+
+## 18. Defaults aligned to Run 16 config
+
+**File:** `train_gpt.py` — `Hyperparameters`
+
+Two default flips so the recommended run command is `QK_GAIN_INIT=5.25 MAX_WALLCLOCK_SECONDS=1200 torchrun --nproc_per_node=2 train_gpt.py` with no other env vars required.
+
+```python
+# Before
+recur_num_loops = int(os.environ.get("RECUR_NUM_LOOPS", 2))
+untie_loop_mlps = bool(int(os.environ.get("UNTIE_LOOP_MLPS", "0")))
+
+# After
+recur_num_loops = int(os.environ.get("RECUR_NUM_LOOPS", 1))
+untie_loop_mlps = bool(int(os.environ.get("UNTIE_LOOP_MLPS", "1")))
+```
+
+`recur_num_loops=1` reverts away from the progressive-curriculum config that produced Run 15's
++0.42 gap; `untie_loop_mlps=1` was actually wrong on the artifact-size estimate (~1.1 MB extra,
+not the 300 KB the previous diagnosis claimed) but stayed within the 16 MB budget on Run 16.
+
+---
+
+## 19. Run 16 post-mortem and stop point
+
+**Run 16 result (full 2400s server run, 2×H100, all of Changes 1–18):**
+
+| Metric | Run 14 (baseline) | Run 15 (progressive) | **Run 16 (fixes)** |
+|---|---|---|---|
+| Wallclock | 1200s | 2400s | 2400s |
+| Steps | 4979 | 5476 | 5540 |
+| Pre-quant val_bpb | 1.1510 | 1.1460 | **1.1447** |
+| Post-quant val_bpb | 1.4658 | 1.5614 | **1.4508** |
+| Quant gap | +0.315 | +0.415 | **+0.306** |
+| Artifact size | 14.16 MB | 14.21 MB | 15.57 MB |
+
+Run 16 produced the **best post-quant result on this codebase (1.4508 BPB)** but the gap shrank
+only −0.009 BPB vs. Run 14. The previous diagnosis estimated the GPTQ fix bundle would close
+~−0.18 BPB; the actual delta was an order of magnitude smaller.
+
+### Why the diagnosis under-delivered
+
+The three bugs were real and worth fixing, but none were the dominant gap contributor:
+
+1. **Double damping (17a)**: real bug, worth fixing for code correctness, but the actual numerical
+   damage was small. 0.01 vs 0.0201 damping mostly affects rounding behavior near dead columns;
+   the bulk of the per-column GPTQ updates barely change.
+2. **k_matrix 12.85 → 5.0 (17b)**: lowered MSE per row but increased clipping at the tails.
+   Net BPB benefit was much smaller than the int-level utilization argument suggested — brotli
+   is also worse at compressing the higher-entropy int6 distribution, partially offsetting the
+   precision gain.
+3. **lm_head Hessian (17c)**: the lm_head was already getting reasonable int8 SDClip quantization
+   without GPTQ. The marginal benefit of error compensation is small at int8.
+4. **Untied loop MLPs (the structural fix from Change 18)**: gave each repeat pass a clean Hessian
+   on the proj weight, but the post-quant improvement vs. Run 15 was dominated by reverting away
+   from the 3× recurrence regression, not by the untying itself.
+
+The residual ~+0.30 BPB gap appears to be a fundamental property of int6 GPTQ quantization
+applied to this 11L×512d model at 2×H100 compute. Pipeline fixes can shave ~0.01–0.02 off the
+gap; the rest requires algorithmic changes.
+
+### What would actually close the gap (research-level, not implemented)
+
+Ranked by literature-supported expected impact:
+
+1. **Quantization-Aware Training (QAT)** — fold quantize/dequantize into the forward pass for the
+   last 500–2000 training steps so weights co-adapt with the quantizer. Standard technique;
+   typical impact is −0.05 to −0.15 BPB on small models. Not in this codebase.
+2. **Group-wise scales** — replace per-row scale with per-N-column-block scale (e.g., groups of 64
+   or 128). Roughly 2× metadata cost (~200 KB extra) but materially better quantization on
+   non-stationary weight distributions. Standard in modern int4/int6 schemes.
+3. **Learned codebooks** — instead of fixed-step int6, learn per-row codebooks (or per-block).
+   Compresses worse with brotli but quantizes much better. Worth ~−0.05 to −0.10 BPB if the
+   metadata overhead can be amortized.
+4. **Activation choices that produce quantization-friendly weights** — e.g., normalization that
+   bounds row-wise std, or weight reparameterizations (W = αÛ for unit-norm Û and learnable α).
+   Some SOTA records hint at this; not documented well enough for direct port.
+
+### Stop point
+
+This codebase reaches ~1.45 BPB post-quant at 2×H100 / 2400s. Closing the gap to SOTA's
+~1.16 BPB requires implementing one or more of (1)–(4) above plus the compute to validate them.
+That is a research effort, not a tweak, and is left for a future iteration.

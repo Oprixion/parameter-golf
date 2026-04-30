@@ -109,3 +109,150 @@ Serialized model gptq-int6+brotli11: 4408148 bytes (payload:7010960 raw_torch:70
 Total submission size gptq-int6+brotli11: 4466272 bytes
 final_gptq_int6_brotli11_roundtrip val_loss:5.5990 val_bpb:2.4332 eval_time:5588ms
 final_gptq_int6_brotli11_roundtrip_exact val_loss:5.59895441 val_bpb:2.43324183
+
+# Run 11: Set QK-Gain init = 4.0 for Conservative starting point
+step:200/200 loss:4.1869 dt:195.6ms lr:4.00e-02 tok/s:335,021 train_time:61250ms step_avg:306.25ms eta:0s
+step:200/200 val_loss:4.2293 val_bpb:1.8380 train_time:61255ms step_avg:306.28ms
+peak memory allocated: 1022 MiB reserved: 1632 MiB
+Serialized model: 18688407 bytes
+Code size: 58124 bytes
+Total submission size: 18746531 bytes
+ema_applied: loaded EMA shadow weights for quantization
+Serialized model gptq-int6+brotli11: 4410605 bytes (payload:7010960 raw_torch:7045345 payload_ratio:2.66x)
+Total submission size gptq-int6+brotli11: 4468729 bytes
+final_gptq_int6_brotli11_roundtrip val_loss:5.6568 val_bpb:2.4584 eval_time:5240ms
+final_gptq_int6_brotli11_roundtrip_exact val_loss:5.65682248 val_bpb:2.45839063
+
+# Run 12: Full 20-min run — Changes 1–12 (4×H100, MAX_WALLCLOCK=1200s ≡ 8×H100 600s)
+step:5832/20000 val_loss:2.7938 val_bpb:1.2142 train_time:1200122ms step_avg:205.78ms
+stopping_early: wallclock_cap train_time:1200122ms step:5832/20000
+peak memory allocated: 23304 MiB reserved: 23884 MiB
+Serialized model: 131215522 bytes (131 MB float32)
+Code size: 58125 bytes
+ema_applied: loaded EMA shadow weights for quantization
+Serialized model gptq-int6+brotli11: 13041574 bytes (payload_ratio:3.86x)
+Total submission size gptq-int6+brotli11: 13099699 bytes (13.10 MB)
+final_gptq_int6_brotli11_roundtrip val_bpb: 1.5208
+Notes:
+- Config: 11L, 512d, 8H/4KV, MLP×4, SP4096, tied embeddings, logit_softcap=30, RoPE
+- Muon WD=0.085, MuonEq-R, EMA decay=0.9965, QK-gain init=4.0
+- Depth recurrence: layers [4,5]×2, activated at step 3000 (within this run)
+- GPTQ int6 SDClip (k_matrix=12.85, k_embed=20.0), 64 calib batches, brotli-11
+- Quantization gap: +0.3066 BPB (1.2142 → 1.5208); likely due to recurrent layers
+  being hard to calibrate with 64 batches after activation at step 3000
+- Artifact 13.10 MB — within 16 MB limit
+
+# Run 13: Full 20-min run + Vocab_Size = 8192
+step:5028/20000 val_loss:2.9768 val_bpb:1.1524 train_time:1199808ms step_avg:238.63ms
+stopping_early: wallclock_cap train_time:1199808ms step:5028/20000
+peak memory allocated: 25372 MiB reserved: 27144 MiB
+Serialized model: 135409826 bytes
+Code size: 58147 bytes
+Total submission size: 135467973 bytes
+final_gptq_int6_brotli11_roundtrip val_loss:3.7854 val_bpb:1.4655 eval_time:3517ms
+final_gptq_int6_brotli11_roundtrip_exact val_loss:3.78541738 val_bpb:1.46545303
+
+# Run 14: Full 20-min run + Vocab_Size = 8192, Parallel residuals — layers 7+ and 3 Layers recurrence
+step:4979/20000 val_loss:2.9731 val_bpb:1.1510 train_time:1199987ms step_avg:241.01ms
+stopping_early: wallclock_cap train_time:1199987ms step:4979/20000
+peak memory allocated: 26310 MiB reserved: 27434 MiB
+Serialized model: 135411874 bytes
+Code size: 58998 bytes
+Total submission size: 135470872 bytes
+Total submission size gptq-int6+brotli11: 14157593 bytes
+final_gptq_int6_brotli11_roundtrip val_loss:3.7864 val_bpb:1.4658 eval_time:4045ms
+final_gptq_int6_brotli11_roundtrip_exact val_loss:3.78642852 val_bpb:1.46584448
+
+# Run 15: Progressive recurrence curriculum — loop [4,5]×3, frac-based activation
+step:5476/20000 val_loss:2.9601 val_bpb:1.1460 train_time:2399992ms step_avg:438.27ms
+stopping_early: wallclock_cap train_time:2399992ms step:5476/20000
+peak memory allocated: 28162 MiB reserved: 29096 MiB
+Serialized model: 135411874 bytes
+Code size: 64756 bytes
+Total submission size: 135476630 bytes
+ema_applied: loaded EMA shadow weights for quantization
+Serialized model gptq-int6+brotli11: 14146228 bytes (payload:36125024 raw_torch:36179596 payload_ratio:3.75x)
+Total submission size gptq-int6+brotli11: 14210984 bytes
+final_gptq_int6_brotli11_roundtrip val_loss:4.0333 val_bpb:1.5614 eval_time:8778ms
+final_gptq_int6_brotli11_roundtrip_exact val_loss:4.03326175 val_bpb:1.56140131
+Notes:
+- Hardware: 2×H100, MAX_WALLCLOCK_SECONDS=2400, QK_GAIN_INIT=5.25
+- Config: SP8192, 11L, 512d, loop [4,5]×3 (phase1 at 50%, phase2 at 65% of wallclock)
+  - recurrence_active:phase1 step:3217 frac:0.515
+  - recurrence_active:phase2 step:3918 frac:0.665
+- Parallel residuals: layers 7+, untie_loop_mlps=False
+- GPTQ int6 SDClip (k_matrix=12.85, k_embed=20.0), 64 calib batches, brotli-11
+- Quantization gap: +0.415 BPB (1.1460 → 1.5614) — worse than Run 14 (+0.315)
+- Root cause: blocks [4,5] run 3× per forward pass; blended Hessian from 3 activation
+  distributions makes GPTQ error compensation unreliable for shared weights
+- SOTA (+0.012 gap) uses same architecture but 8×H100 — much better pre-quant model
+  makes GPTQ error relatively smaller; cannot replicate at 2×H100 scale
+- Experiment abandoned due to compute cost
+
+# Run 16: GPTQ pipeline fix bundle (de-dup damping + k=5.0 + lm_head Hessian + untied loop MLPs)
+step:5540/20000 val_loss:2.9568 val_bpb:1.1447 train_time:2399760ms step_avg:433.17ms
+stopping_early: wallclock_cap train_time:2399760ms step:5540/20000
+peak memory allocated: 24442 MiB reserved: 25496 MiB
+Serialized model: 152188714 bytes
+Code size: 66748 bytes
+Total submission size: 152255462 bytes
+ema_applied: loaded EMA shadow weights for quantization
+Serialized model gptq-int6+brotli11: 15507569 bytes (payload:40327520 raw_torch:40384636 payload_ratio:3.77x)
+Total submission size gptq-int6+brotli11: 15574317 bytes
+final_gptq_int6_brotli11_roundtrip val_loss:3.7475 val_bpb:1.4508 eval_time:7074ms
+final_gptq_int6_brotli11_roundtrip_exact val_loss:3.74753550 val_bpb:1.45078778
+Notes:
+- Hardware: 2×H100, MAX_WALLCLOCK_SECONDS=2400, QK_GAIN_INIT=5.25
+- Config: SP8192, 11L, 512d, recur [4,5]×2 (RECUR_NUM_LOOPS=1), parallel_resid_start=7
+- Untied loop MLPs: enabled (UNTIE_LOOP_MLPS=1) — 2 extra MLPs for the [4,5] repeat pass
+- GPTQ fixes applied (Change 17): no double damping, k_matrix=5.0, lm_head Hessian collected
+- Quantization gap: +0.306 BPB (1.1447 → 1.4508)
+- Best post-quant result so far (vs Run 14 1.4658, Run 15 1.5614)
+- Gap delta vs Run 14: −0.009 BPB (essentially noise — fixes did not close the structural gap)
+- Pre-quant gain vs Run 15: −0.001 (noise); post-quant gain vs Run 15: −0.111 (untied MLPs +
+  GPTQ fixes recovered most of the Run 15 progressive-curriculum regression)
+- Artifact 15.57 MB — within 16 MB budget but tight; further capacity additions risk busting
+
+## Verdict
+- The 3 GPTQ pipeline bugs were real but not the dominant cause of the +0.30 gap. Fixes delivered
+  ~−0.015 BPB, not the ~−0.18 BPB the previous diagnosis estimated.
+- The gap appears structural at 2×H100 compute scale. Closing it requires research-level work
+  (QAT, learned quantizers, group-wise scales, or different weight distributions by construction)
+  rather than pipeline tuning.
+- Best leaderboard-comparable result: 1.4508 BPB. Walking away from further iteration here.
+
+# TODO
+
+## Ranked by expected BPB impact (highest → lowest)
+
+### 1. SP8192 vocabulary (~−0.025 BPB) ✅ Done
+- Download dataset from `kevclark/parameter-golf` (fineweb10B_sp8192)
+- Update `data_path`, `tokenizer_path`, `vocab_size = 8192` in Hyperparameters
+- Embedding table: 8192×512 = 4.2M params → ~8.4MB bf16, still fits under 16MB with int6 GPTQ
+- Blocker: dataset download required first
+
+### 2. Parallel residuals — layers 7+ (~−0.010 BPB + quant gap reduction) ✅ Done
+- GPT-J style: attention and MLP read from same pre-residual input at layers 7–10
+- Zero parameter cost, fixes quantization gap by reducing activation interference during GPTQ calibration
+- `Block.forward`: save `residual = x` before attn, compute `x = residual + attn(x) + mlp(residual)` for parallel layers
+
+### 3. Extend recurrence to 3 layers: [3,4,5] (~−0.010 BPB) ✅ Done
+- Currently looping [4,5]; SOTA loops [3,4,5] for 17 virtual layers from 11 physical
+- Change `recur_loop_start = 3`, U-Net skip indices regenerate automatically
+
+### 4. QK-gain 4.0 → 5.25 (~−0.005 BPB, trivial) ✅ Done
+- Single env var: `QK_GAIN_INIT=5.25`
+- Leaderboard shows monotonic improvement: 4.0 → 5.0 → 5.25; no code change needed
+
+### 5. Partial RoPE: 16/64 head dims (~−0.003 BPB)
+- Apply RoPE only to first 16 of 64 head dimensions; remaining 48 dims are position-agnostic
+- Used in all SOTA records from 2026-03-21 onward
+
+### 6. Layerwise LN scale (~−0.002 BPB)
+- Per-layer learnable scalar on the RMSNorm output (one param per layer, AdamW group)
+- Allows depth-dependent normalization strength; negligible parameter cost
+
+### 7. Legal score-first TTT (~−0.002 BPB at eval time, most complex)
+- Chunk val tokens into 32K-token chunks
+- Phase 1: score all windows under `torch.no_grad()`; Phase 2: SGD on scored chunk
+- SGD lr=0.005, momentum=0.9, 3 epochs per chunk, cosine LR decay, grad clip 1.0

@@ -167,8 +167,8 @@ Do not replicate SOTA incrementally. Implement the entire April 5 stack in a sin
 | ~~naive int8 round → full Hessian GPTQ int6 (SDClip)~~ | ✅ Done Higher quantization fidelity; `clip = k × std(row)` is principled and tunable |
 | ~~MuonEq-R (row-normalize before Newton-Schulz)~~ | ✅ Done Zero byte cost; ~0.001 BPB improvement |
 | ~~Depth recurrence: loop layers 4,5 ×2, activate at step ~3000~~ | ✅ Done 13 virtual layers from 11 physical; zero extra params |
-| EMA decay 0.9965 | Stable weight averaging with no SWA scheduling complexity |
-| QK-Gain init = 4.0 | Conservative starting point; monotonic improvement confirmed up to 5.25 |
+| ~~EMA decay 0.9965~~ | ✅ Done Stable weight averaging with no SWA scheduling complexity |
+| ~~QK-Gain init = 4.0~~ | ✅ Done Conservative starting point; monotonic improvement confirmed up to 5.25 |
 
 **Calibration check after this run:** Measure post-brotli artifact size. If above 16 MB, increase WD by 0.005 increments. The correlation between weight RMS and brotli compressibility is R²≈0.99 — WD is the primary artifact-size dial.
 
@@ -176,10 +176,10 @@ Do not replicate SOTA incrementally. Implement the entire April 5 stack in a sin
 
 These are the differences between the April 5 run (~1.0856) and the April 9 SOTA (1.0810). They are not "novel" — they are already proven and just not in the Step 1 code.
 
-1. **SP4096 → SP8192.** Each additional vocabulary doubling gives a measurable BPB improvement. Requires downloading the SP8192 data shard.
+1. **SP4096 → SP8192.** Each additional vocabulary doubling gives a measurable BPB improvement. Requires downloading the SP8192 data shard. ✅ Done
 2. **GPTQ on the embedding table.** The April 5 record used simple round-to-nearest for embeddings; April 9 applied full Hessian GPTQ to them too. Small but consistent win.
-3. **Parallel residuals from layer 7.** GPT-J style: attention and MLP read from the same pre-residual input and a learned `lane_merge` scalar combines them. Allows specialization without adding parameters.
-4. **3-layer recurrence (extend loop to layers 3,4,5).** The step from 2-layer to 3-layer recurrence contributed to the April 9 improvement.
+3. **Parallel residuals from layer 7.** GPT-J style: attention and MLP read from the same pre-residual input and a learned `lane_merge` scalar combines them. Allows specialization without adding parameters. ✅ Done
+4. **3-layer recurrence (extend loop to layers 3,4,5).** The step from 2-layer to 3-layer recurrence contributed to the April 9 improvement. 
 5. **QK-Gain tuning: sweep 4.0 → 5.0 → 5.25.** Monotonically improving; find the optimum.
 6. **Score-First Legal TTT.** SGD adaptation (lr=0.005, momentum=0.9, 3 epochs per 32K-token chunk, cosine LR decay). Score all tokens in a chunk under `torch.no_grad()` *before* any weight update. This is the highest-return remaining lever and should not be treated as optional — it is responsible for a significant share of the gap between 1.0856 and 1.0810. The four compliance conditions (causality, normalized distribution, score-before-update, single-pass) must be verified explicitly.
 

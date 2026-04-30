@@ -31,17 +31,17 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # HYPERPARAMETERS
 # -----------------------------
 # Default Simple Baseline run:
-# - 9 transformer blocks at width 512
+# - 11 transformer blocks at width 512
 # - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
 # - vocab size 4096, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp4096")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_4096_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -57,10 +57,10 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 4.0))
 
     # Model shape.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 4096))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
@@ -87,14 +87,30 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 64))
-    gptq_sdclip_k_matrix = float(os.environ.get("GPTQ_SDCLIP_K_MATRIX", 12.85))
+    # k_matrix * std controls the int6 clip range. With clip_range=31, scale_per_row = k*sigma/31.
+    # k=12.85 puts a typical +/-3sigma weight at int level +/-7 — only ~15/63 levels used, leaving
+    # huge resolution loss for the bulk of the distribution while saving brotli entropy.
+    # k=5.0 is closer to MSE-optimal for int6 Gaussian (clip ~3sigma) and uses ~38/63 levels.
+    gptq_sdclip_k_matrix = float(os.environ.get("GPTQ_SDCLIP_K_MATRIX", 5.0))
     gptq_sdclip_k_embed = float(os.environ.get("GPTQ_SDCLIP_K_EMBED", 20.0))
     # Depth recurrence: repeat layers [loop_start..loop_end] an extra num_loops times.
-    # 0 = disabled. Activated at recur_start_step to avoid early training instability.
+    # 0 = disabled. Progressive curriculum: phase 1 activates 1 repeat at recur_phase1_frac,
+    # phase 2 activates all num_loops repeats at recur_phase2_frac (fraction of max_wallclock).
     recur_loop_start = int(os.environ.get("RECUR_LOOP_START", 4))
     recur_loop_end = int(os.environ.get("RECUR_LOOP_END", 5))
-    recur_num_loops = int(os.environ.get("RECUR_NUM_LOOPS", 1))  # extra passes; 1 = run segment twice
-    recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
+    # extra passes; 1 = segment runs 2x (Run 14 config). 2 = 3x runs hit Hessian-blending hard
+    # at 2xH100 scale (Run 15: gap +0.42). Reverted to 1 as the known-OK baseline.
+    recur_num_loops = int(os.environ.get("RECUR_NUM_LOOPS", 1))
+    recur_phase1_frac = float(os.environ.get("RECUR_PHASE1_FRAC", 0.50))  # fraction of wallclock to activate phase 1
+    recur_phase2_frac = float(os.environ.get("RECUR_PHASE2_FRAC", 0.65))  # fraction of wallclock to activate phase 2
+    # Untied loop MLPs: enabled by default — at 2xH100 the structural Hessian-blending on the
+    # shared MLP proj is the dominant post-quant error. Untying gives each repeat pass a clean
+    # Hessian. Adds ~1.1 MB to the artifact (still well under 16 MB). SOTA disables this at
+    # 8xH100 because their pre-quant is converged enough that the blending error is relatively
+    # small; at our scale we cannot afford it.
+    untie_loop_mlps = bool(int(os.environ.get("UNTIE_LOOP_MLPS", "1")))
+    # Parallel residuals: layers >= parallel_resid_start use GPT-J style (attn and MLP read same input).
+    parallel_resid_start = int(os.environ.get("PARALLEL_RESID_START", 7))
     # EMA: shadow copy of weights, updated every step. Applied before GPTQ at end of training.
     ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
 
@@ -333,7 +349,15 @@ def collect_hessians(
     grad_accum_steps: int,
     num_batches: int = 64,
 ) -> dict[str, Tensor]:
-    """Accumulate H = X^T X for each CastedLinear weight via forward hooks on calibration data."""
+    """Accumulate H = X^T X for each CastedLinear weight via forward hooks on calibration data.
+
+    Calibration always runs with looping_active=True so every weight sees the actual activation
+    distributions it was trained on. For shared physical attention weights (blocks that execute
+    on multiple passes), the accumulated H = H_pass0 + H_pass1 is the correct objective for GPTQ:
+    it minimizes the total quantization error across all uses of the shared weight, which is
+    mathematically optimal when a single quantized copy must serve multiple activation distributions.
+    Override MLPs only fire on their specific repeat pass, so they naturally get a clean Hessian.
+    """
     hessians: dict[str, Tensor] = {}
     hooks = []
     for name, module in model.named_modules():
@@ -348,6 +372,21 @@ def collect_hessians(
                     hessians[pname].add_((x.T @ x).cpu())
                 return hook_fn
             hooks.append(module.register_forward_hook(make_hook(name + ".weight")))
+    # Tied lm_head: tok_emb.weight is reused as the output projection via F.linear at the end of
+    # forward(). That call is not a CastedLinear, so the hook above never fires for it. Hook the
+    # final_norm output instead — its post-norm activations are the input to F.linear(x, tok_emb).
+    if model.tie_embeddings:
+        emb_dim = model.tok_emb.weight.shape[1]
+        hessians["tok_emb.weight"] = torch.zeros(emb_dim, emb_dim, dtype=torch.float32)
+        def lm_head_hook(_m, _inp, out):
+            x = out.detach().float()
+            if x.ndim == 3:
+                x = x.reshape(-1, x.shape[-1])
+            hessians["tok_emb.weight"].add_((x.T @ x).cpu())
+        hooks.append(model.final_norm.register_forward_hook(lm_head_hook))
+    # Force looping active so calibration reflects the trained computation graph.
+    prev_looping = model.looping_active
+    model.looping_active = True
     model.eval()
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for _ in range(num_batches):
@@ -355,6 +394,7 @@ def collect_hessians(
             model(x, y)
     for h in hooks:
         h.remove()
+    model.looping_active = prev_looping
     for pname, H in hessians.items():
         H.div_(num_batches)
         damp = 0.01 * H.diagonal().mean().clamp_min(1e-6)
@@ -393,7 +433,9 @@ def quantize_float_tensor_gptq(
     H = hessian.float().clone()
     dead = torch.diag(H) == 0
     H[dead, dead] = 1.0
-    H.diagonal().add_(0.01 * torch.diag(H).mean())
+    # NOTE: damping is applied once in collect_hessians (1% of mean diag). Do not damp again
+    # here — double damping flattens H_diag and weakens both column ordering and Hinv off-diag
+    # error compensation. This bug accounted for ~+0.05 BPB of the post-quant gap.
     perm = torch.argsort(H.diagonal(), descending=True)
     inv_perm = torch.argsort(perm)
     W = t32[:, perm].clone()
@@ -531,7 +573,9 @@ def quantize_state_dict_int8(
         is_embed = "tok_emb" in name or "lm_head" in name
         cr = 127 if is_embed else 31
         sk = sdclip_k_embed if is_embed else sdclip_k_matrix
-        H = (hessians.get(name) if hessians is not None else None) if not is_embed else None
+        # Pass Hessian through for embed too — collect_hessians now provides one for tok_emb.weight
+        # by hooking final_norm (its output is the input to the tied F.linear lm_head projection).
+        H = hessians.get(name) if hessians is not None else None
         q, s = quantize_float_tensor_gptq(t, H, sk, cr)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
@@ -765,7 +809,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
 
 
@@ -778,8 +822,10 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        parallel: bool = False,
     ):
         super().__init__()
+        self.parallel = parallel
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
@@ -791,9 +837,17 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        if self.parallel:
+            # GPT-J style: attn and MLP both read from the same pre-block x.
+            # Decouples their Hessians during GPTQ calibration.
+            attn_out = self.attn(self.attn_norm(x))
+            mlp_out = self.mlp(self.mlp_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out \
+                  + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        else:
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -813,7 +867,9 @@ class GPT(nn.Module):
         qk_gain_init: float,
         recur_loop_start: int = 4,
         recur_loop_end: int = 5,
-        recur_num_loops: int = 1,
+        recur_num_loops: int = 2,
+        untie_loop_mlps: bool = False,
+        parallel_resid_start: int = 7,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -826,23 +882,48 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         # Build virtual-to-physical index lists for depth recurrence.
-        # When looping_active=True, the forward uses encoder_indices/decoder_indices instead
-        # of the physical range, giving 13 virtual layers from 11 physical (loop_start=4, loop_end=5).
+        # Progressive curriculum: phase 1 adds 1 repeat, phase 2 adds all num_loops repeats.
+        # activate_looping(phase) switches encoder_indices/decoder_indices at runtime.
         self.looping_active = False
         if recur_num_loops > 0:
             loop_seg = list(range(recur_loop_start, recur_loop_end + 1))
-            all_indices: list[int] = list(range(recur_loop_start))
+            # Phase 1: one extra repeat (2 total passes through loop segment)
+            all1: list[int] = list(range(recur_loop_start))
+            for _ in range(2):  # always 1 extra = 2 total passes
+                all1.extend(loop_seg)
+            all1.extend(range(recur_loop_end + 1, num_layers))
+            ne1 = len(all1) // 2
+            self._phase1_enc: list[int] = all1[:ne1]
+            self._phase1_dec: list[int] = all1[ne1:]
+            # Phase 2: full num_loops extra repeats
+            all2: list[int] = list(range(recur_loop_start))
             for _ in range(recur_num_loops + 1):
-                all_indices.extend(loop_seg)
-            all_indices.extend(range(recur_loop_end + 1, num_layers))
-            num_enc_loop = len(all_indices) // 2
-            self.encoder_indices: list[int] = all_indices[:num_enc_loop]
-            self.decoder_indices: list[int] = all_indices[num_enc_loop:]
-            self.num_skip_weights = min(len(self.encoder_indices), len(self.decoder_indices))
+                all2.extend(loop_seg)
+            all2.extend(range(recur_loop_end + 1, num_layers))
+            ne2 = len(all2) // 2
+            self._phase2_enc: list[int] = all2[:ne2]
+            self._phase2_dec: list[int] = all2[ne2:]
+            # Start with phase 2 indices pre-loaded (activate_looping will set them).
+            self.encoder_indices: list[int] = self._phase2_enc
+            self.decoder_indices: list[int] = self._phase2_dec
+            self.num_skip_weights = min(len(self._phase2_enc), len(self._phase2_dec))
         else:
-            self.encoder_indices = list(range(self.num_encoder_layers))
-            self.decoder_indices = list(range(self.num_encoder_layers, num_layers))
+            self._phase1_enc = list(range(self.num_encoder_layers))
+            self._phase1_dec = list(range(self.num_encoder_layers, num_layers))
+            self._phase2_enc = self._phase1_enc
+            self._phase2_dec = self._phase1_dec
+            self.encoder_indices = self._phase2_enc
+            self.decoder_indices = self._phase2_dec
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        # Untied loop MLPs: one extra MLP per looped layer per extra pass.
+        # Shared attention weights are reused; only the MLP differs per pass.
+        self.override_mlps: nn.ModuleDict | None = None
+        if recur_num_loops > 0 and untie_loop_mlps:
+            self.override_mlps = nn.ModuleDict({
+                f"{i}_p{pc}": MLP(model_dim, mlp_mult)
+                for i in range(recur_loop_start, recur_loop_end + 1)
+                for pc in range(1, recur_num_loops + 1)
+            })
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -852,6 +933,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    parallel=(i >= parallel_resid_start),
                 )
                 for i in range(num_layers)
             ]
@@ -862,6 +944,19 @@ class GPT(nn.Module):
             self.lm_head._zero_init = True
         self._init_weights()
 
+    def activate_looping(self, phase: int) -> None:
+        """Switch depth-recurrence phase. 0=off, 1=one repeat, 2=full repeats."""
+        if phase == 0:
+            self.looping_active = False
+        elif phase == 1:
+            self.encoder_indices = self._phase1_enc
+            self.decoder_indices = self._phase1_dec
+            self.looping_active = True
+        else:
+            self.encoder_indices = self._phase2_enc
+            self.decoder_indices = self._phase2_dec
+            self.looping_active = True
+
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
@@ -869,21 +964,47 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def _block_forward(self, i: int, x: Tensor, x0: Tensor, pass_num: int) -> Tensor:
+        """Run block i, substituting the override MLP on repeat passes (pass_num > 0)."""
+        block = self.blocks[i]
+        mlp = (
+            self.override_mlps[f"{i}_p{pass_num}"]
+            if pass_num > 0 and self.override_mlps is not None and f"{i}_p{pass_num}" in self.override_mlps
+            else block.mlp
+        )
+        mix = block.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        if block.parallel:
+            x = (
+                x
+                + block.attn_scale.to(dtype=x.dtype)[None, None, :] * block.attn(block.attn_norm(x))
+                + block.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp(block.mlp_norm(x))
+            )
+        else:
+            x = x + block.attn_scale.to(dtype=x.dtype)[None, None, :] * block.attn(block.attn_norm(x))
+            x = x + block.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp(block.mlp_norm(x))
+        return x
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
+        pass_count: dict[int, int] = {}
 
         enc_iter = self.encoder_indices if self.looping_active else range(self.num_encoder_layers)
         dec_iter = self.decoder_indices if self.looping_active else range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers)
         for i in enc_iter:
-            x = self.blocks[i](x, x0)
+            pc = pass_count.get(i, 0)
+            x = self._block_forward(i, x, x0, pc)
+            pass_count[i] = pc + 1
             skips.append(x)
         for skip_idx, i in enumerate(dec_iter):
             if skips and skip_idx < self.num_skip_weights:
                 x = x + self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[i](x, x0)
+            pc = pass_count.get(i, 0)
+            x = self._block_forward(i, x, x0, pc)
+            pass_count[i] = pc + 1
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1013,13 +1134,17 @@ def main() -> None:
         recur_loop_start=args.recur_loop_start,
         recur_loop_end=args.recur_loop_end,
         recur_num_loops=args.recur_num_loops,
+        untie_loop_mlps=args.untie_loop_mlps,
+        parallel_resid_start=args.parallel_resid_start,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if _can_compile else base_model
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    # find_unused_parameters=True is required because override_mlps are inactive before looping_active=True,
+    # meaning those parameters receive no gradient during warmup and early training steps.
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=base_model.override_mlps is not None) if distributed else compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1039,6 +1164,13 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    # Add override MLP parameters (untied loop MLPs) to the Muon optimizer.
+    if base_model.override_mlps is not None:
+        for name, p in base_model.override_mlps.named_parameters():
+            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                matrix_params.append(p)
+            else:
+                scalar_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1225,11 +1357,19 @@ def main() -> None:
             decay = args.ema_decay
             for name, param in base_model.named_parameters():
                 ema_weights[name].mul_(decay).add_(param.detach().cpu(), alpha=1.0 - decay)
-        # Activate depth recurrence once we reach the scheduled step.
-        if args.recur_num_loops > 0 and not base_model.looping_active and step >= args.recur_start_step:
-            base_model.looping_active = True
-            log0(f"recurrence_active:True step:{step} loop:[{args.recur_loop_start},{args.recur_loop_end}]x{args.recur_num_loops + 1}")
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        # Activate depth recurrence using a progressive curriculum keyed on elapsed wallclock fraction.
+        # Phase 1 (1 extra repeat) activates at recur_phase1_frac; phase 2 (full repeats) at recur_phase2_frac.
+        if args.recur_num_loops > 0 and max_wallclock_ms is not None:
+            elapsed_frac = approx_training_time_ms / max_wallclock_ms
+            cur_phase = (2 if base_model.looping_active and base_model.encoder_indices is base_model._phase2_enc
+                         else 1 if base_model.looping_active else 0)
+            if cur_phase == 0 and elapsed_frac >= args.recur_phase1_frac:
+                base_model.activate_looping(1)
+                log0(f"recurrence_active:phase1 step:{step} loop:[{args.recur_loop_start},{args.recur_loop_end}]x2 frac:{elapsed_frac:.3f}")
+            elif cur_phase == 1 and elapsed_frac >= args.recur_phase2_frac:
+                base_model.activate_looping(2)
+                log0(f"recurrence_active:phase2 step:{step} loop:[{args.recur_loop_start},{args.recur_loop_end}]x{args.recur_num_loops + 1} frac:{elapsed_frac:.3f}")
         step_dt_ms = 1000.0 * (time.perf_counter() - step_t0)
         should_log_train = (
             args.train_log_every > 0
